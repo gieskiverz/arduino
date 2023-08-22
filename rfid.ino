@@ -60,7 +60,7 @@ void ReadConfig() {
         }
       }
     }
-    configFile.close(); // Close the config.txt file
+    configFile.close();
   } else {
     Serial.println("Error opening config.txt");
   }
@@ -101,13 +101,34 @@ void setup() {
     Serial.println("Error initializing SD card!");
   }
 
-  ReadConfig();
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-  Serial.print("Password: ");
-  Serial.println(password);
-  Serial.print("API Endpoint: ");
-  Serial.println(apiEndpoint);
+  // ReadConfig();
+  File configFile = SD.open("/config.txt");
+  if (configFile) {
+    String ssid;
+    String password;
+    Serial.println("Reading config.txt");
+    while (configFile.available()) {
+      String line = configFile.readStringUntil('\n');
+      int separatorIndex = line.indexOf(':');
+      if (separatorIndex != -1) {
+        String key = line.substring(0, separatorIndex);
+        String value = line.substring(separatorIndex + 1);
+        if (key == "ssid") {
+          ssid = value;
+        } else if (key == "password") {
+          password = value;
+        } else if (key == "apiEndpoint") {
+          apiEndpoint = value;
+        }
+      }
+    }
+  configFile.close();
+  // Serial.print("SSID: ");
+  // Serial.println(ssid);
+  // Serial.print("Password: ");
+  // Serial.println(password);
+  // Serial.print("API Endpoint: ");
+  // Serial.println(apiEndpoint);
   // Connect to Wi-Fi
   Serial.println("Connecting to Wi-Fi...");
   WiFi.begin(ssid, password);
