@@ -1,0 +1,608 @@
+#include <Arduino.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <SD.h>
+#include <time.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+
+#define TRIGGER_PIN 32
+#define BUZZER_PIN 4
+#define GREEN_PIN 16
+#define RED_PIN 17
+#define RST_PIN     22
+#define SS_PIN_RC522 5
+#define SS_PIN_SD   15 // Use HSPI SDA (D8) as CS for SD card module
+
+MFRC522 mfrc522(SS_PIN_RC522, RST_PIN);
+File dataFile;
+
+WiFiManager wm; // global wm instance
+WiFiManagerParameter custom_field; // global param ( for non blocking w params )
+
+String ssid = "";
+String password = "";
+String apiEndpoint = "";
+String newApi = "";
+bool configChanged = false;
+
+const char* fileName = "/apidata.txt";
+StaticJsonDocument<1024> jsonConfig;
+JsonArray dataArray = jsonConfig.createNestedArray();
+String macAddress;
+bool sdCardInserted = false; // Status kartu microSD
+
+void setup() {
+  // WiFi.mode(WIFI_STA); // explicitly set mode, esp defaults to STA+AP  
+  // put your setup code here, to run once:
+  Serial.begin(9600);
+  SPI.begin(); 
+  mfrc522.PCD_Init();
+  Serial.println("\n Starting");
+  pinMode(TRIGGER_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  
+  digitalWrite(BUZZER_PIN,HIGH);
+  digitalWrite(RED_PIN,HIGH);
+  digitalWrite(GREEN_PIN,HIGH);
+  
+  Serial.println();
+
+  // Connected to WiFi, so get the MAC address
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+
+  // Convert MAC address to a string and update the global variable using a pointer
+  char macStr[18]; // Buffer for the MAC address as a C-style string
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  macAddress = macStr;
+  //End mac address
+
+  if (SD.begin(SS_PIN_SD)) {
+    dataFile = SD.open("data.txt", FILE_WRITE);
+    Serial.println("SD card initialized successfully!");
+    sdCardInserted = true;
+  } else {
+    Serial.println("Error initializing SD card!");
+  }
+
+  // Connect to Wi-Fi
+  Serial.println("Connecting to Wi-Fi...");
+
+  bool res;
+  // res = wm.autoConnect(); // auto generated AP name from chipid
+  // res = wm.autoConnect("AutoConnectAP"); // anonymous ap
+  konfigurasi();
+  res = wm.autoConnect("SUKASAKU","sukusuku"); // password protected ap
+
+  if(!res) {
+      Serial.println("Failed to connect");
+      digitalWrite(RED_PIN, LOW);
+      // ESP.restart();
+  } 
+  else {
+      digitalWrite(RED_PIN, HIGH);
+      configTime(7 * 3600, 0, "id.pool.ntp.org");
+      while (!time(nullptr)) {
+        Serial.print(".");
+        delay(1000);
+      }
+      // writeConfigToSD("/config.txt", WiFi.SSID(), WiFi.psk(), apiEndpoint);
+      Serial.println("Time synchronized."); 
+      Serial.println("connected...setup yeey :) ");
+  }
+}
+
+void konfigurasi(){
+  const char* menu[] = {"wifi","info","sep","restart","exit"}; 
+  wm.setMenu(menu,6);
+  wm.setClass("invert");
+  new (&custom_field) WiFiManagerParameter("api","host/domain","",50,"placeholder=\"ex: https://sukasaku/logs\"");
+  wm.addParameter(&custom_field);
+  wm.setSaveParamsCallback(saveParamCallback);
+  wm.setConfigPortalTimeout(240);
+}
+void checkButton(){
+  Serial.println("Starting checkbutton");
+  Serial.println(digitalRead(TRIGGER_PIN));
+  Serial.println("-------------");
+  if( digitalRead(TRIGGER_PIN) == HIGH ){
+    Serial.println("Erasing Config, restarting");
+    wm.resetSettings();
+    delay(1000);
+    if (!wm.startConfigPortal("SUKASAKU","sukusuku")) {
+      Serial.println("failed to connect or hit timeout");
+      delay(3000);
+      ESP.restart();
+    } else {
+      // configChanged = true;
+      //if you get here you have connected to the WiFi
+      Serial.println("connected...yeey :)");
+    }
+  }
+}
+
+String getParam(String name){
+  //read parameter from server, for customhmtl input
+  String value;
+  if(wm.server->hasArg(name)) {
+    value = wm.server->arg(name);
+  }
+  apiEndpoint = value;
+  writeConfigToSD("/config.txt",value);
+  return value;
+}
+
+void saveParamCallback(){
+  Serial.println("[CALLBACK] saveParamCallback fired");
+  Serial.println("PARAM api = " + getParam("api"));
+}
+
+bool checkInternet(){
+    HTTPClient http;
+    http.begin("http://www.google.com");
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      return true;
+    } else {
+      return false;
+    }
+    http.end();
+}
+bool sendUIDAndTimestampToAPI(String api, String uuid, String timestamp, String hwid, String stat) {
+  HTTPClient http;
+  http.begin(api);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String postData = "uuid=" + uuid + "&time=" + timestamp + "&hwid=" + hwid + "&stat=" + stat;
+  int httpCode = http.POST(postData);
+
+  if (httpCode == HTTP_CODE_OK) {
+    return true;
+  } else {
+    return false;
+  }
+  http.end();
+}
+
+String getCurrentDateTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Failed to obtain time";
+  }
+  char formattedDateTime[20];
+  strftime(formattedDateTime, sizeof(formattedDateTime), "%d-%m-%Y %H:%M:%S", &timeinfo);
+  return String(formattedDateTime);
+}
+
+void ReadFile(const char * path){
+  // open the file for reading:
+  dataFile = SD.open(path);
+  if (dataFile) {
+     Serial.printf("Reading file from %s\n", path);
+     // read from the file until there's nothing else in it:
+    while (dataFile.available()) {
+      Serial.write(dataFile.read());
+    }
+    dataFile.close(); // close the file:
+  } 
+  else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening test.txt");
+  }
+}
+
+void WriteFile(const char * path, const char * message){
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  dataFile = SD.open(path, FILE_WRITE);
+  // if the file opened okay, write to it:
+  if (dataFile) {
+    Serial.printf("Writing to %s ", path);
+    dataFile.println(message);
+    dataFile.close(); // close the file:
+    Serial.println("completed.");
+  } 
+  // if the file didn't open, print an error:
+  else {
+    Serial.println("error opening file ");
+    Serial.println(path);
+  }
+}
+
+void AppendFile(const char * path, const char * message){
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  dataFile = SD.open(path, FILE_APPEND);
+  // if the file opened okay, write to it:
+  if (dataFile) {
+    Serial.printf("Writing to %s ", path);
+    dataFile.println(message);
+    dataFile.close(); // close the file:
+    Serial.println("completed.");
+  } 
+  // if the file didn't open, print an error:
+  else {
+    Serial.println("error opening file ");
+    Serial.println(path);
+  }
+}
+
+bool readConfigFromSD(const char* path) {
+  File configFile = SD.open(path, FILE_READ);
+  if (!configFile) {
+    return false;
+  }
+
+  // Buat objek JSON untuk menyimpan konfigurasi
+  StaticJsonDocument<256> jsonConfig;
+  DeserializationError error = deserializeJson(jsonConfig, configFile);
+  configFile.close();
+
+  if (error) {
+    Serial.println("Failed to read config file");
+    return false;
+  }
+
+  // Baca nilai konfigurasi dari JSON
+  // ssid = jsonConfig["ssid"].as<String>();
+  // password = jsonConfig["password"].as<String>();
+  // apiEndpoint = jsonConfig["apiEndpoint"].as<String>();
+  newApi = jsonConfig["apiEndpoint"].as<String>();
+  
+  Serial.println("read config file");
+  serializeJsonPretty(jsonConfig, Serial);
+  Serial.println();
+
+  return true;
+}
+
+// Fungsi untuk menulis konfigurasi ke file JSON di SD card
+bool writeConfigToSD(const char* path, String a) {
+  File configFile = SD.open(path, FILE_WRITE);
+  if (!configFile) {
+    return false;
+  }
+
+  // Buat objek JSON untuk menyimpan konfigurasi
+  StaticJsonDocument<256> jsonConfig;
+
+  // Tambahkan nilai konfigurasi ke JSON
+  jsonConfig["apiEndpoint"] = a;
+
+  // Serialize JSON ke file
+  if (serializeJson(jsonConfig, configFile) == 0) {
+    Serial.println("Failed to write config file");
+    return false;
+  }
+
+  configFile.close();
+  return true;
+}
+
+//Fungsi untuk simpan UID offline
+bool writeUID(const char* path, String a, String b, String c) {
+  Serial.println(String(path));
+  Serial.println(a);
+  Serial.println(b);
+  if(SD.exists("/apidata.txt")){
+    Serial.println("data ada");
+  } else {
+    SD.open(path, FILE_WRITE);
+    Serial.println("data tidak ada");
+  }
+  File configFile = SD.open(path, FILE_READ);
+  if (!configFile) {
+    return false;
+  }
+
+  DynamicJsonDocument jsonData(1024);
+  // Buat objek JSON untuk menyimpan konfigurasi
+  DeserializationError error = deserializeJson(jsonData, configFile);
+  configFile.close();
+  
+  File writeFile = SD.open(path, FILE_WRITE);
+  if (!writeFile) {
+    Serial.println("failed writefile");
+    return false;
+  }
+  // jsonData.clear(); // Clear previous data
+  // JsonObject obj = dataArray.createNestedObject();
+  // obj["uid"] = a;
+  // obj["timestamp"] = b; 
+  // String jsonStr;
+  // serializeJson(jsonData, jsonStr);
+  // Serial.println(jsonStr);
+  // // Serialize JSON ke file
+  // if (serializeJsonPretty(jsonData, writeFile) == 0) {
+  //   Serial.println("Failed to write data file");
+  //   return false;
+  // }
+  // Buat objek JSON untuk menyimpan konfigurasi
+  JsonObject obj = jsonData[0].createNestedObject();
+
+  // Tambahkan nilai konfigurasi ke JSON
+  obj["uuid"] = a;
+  obj["time"] = b;
+  obj["hwid"] = macAddress;
+  obj["stat"] = c;
+
+  // Serialize JSON ke file
+  if (serializeJson(jsonData, writeFile) == 0) {
+    Serial.println("Failed to write config file");
+    return false;
+  }
+
+  Serial.println("berhasil tulis data");
+  writeFile.close();
+  return true;
+}
+
+//Fungsi untuk simpan UID offline
+bool readUID(const char* path) {
+  File configFile = SD.open(path, FILE_READ);
+  if (!configFile) {
+    return false;
+  }
+  const size_t bufferSize = JSON_ARRAY_SIZE(6) + 6*JSON_OBJECT_SIZE(4) + 240;
+  DynamicJsonDocument jsonData(bufferSize);
+  // StaticJsonDocument<1024> jsonData;
+  // Buat objek JSON untuk menyimpan konfigurasi
+  DeserializationError error = deserializeJson(jsonData, configFile);
+
+  if (error) {
+    Serial.println("Failed to read data.json file");
+    configFile.close();
+    return false;
+  }
+  int jumlah = jsonData[0].size();
+  bool status_kirim = false;
+  JsonArray data_array = jsonData[0].as<JsonArray>();
+  if(jumlah>0){
+    for (int key = 0; key < data_array.size(); key++) {
+      JsonObject obj = data_array[key];
+      const char* uuid = obj["uuid"];
+      const char* time = obj["time"];
+      const char* hwid = obj["hwid"];
+      const char* stat = obj["stat"];
+      Serial.print("Key: ");
+      Serial.println(key);
+      Serial.print("UUID: ");
+      Serial.println(uuid);
+      Serial.print("Time: ");
+      Serial.println(time);
+      Serial.print("HWID: ");
+      Serial.println(hwid);
+      Serial.print("Stat: ");
+      Serial.println(stat);
+      Serial.println("----------");
+
+      // if(sendUIDAndTimestampToAPI(newApi,uuid,time)){
+      //   deleteDataFromSD(key);
+      // }
+      if(sendUIDAndTimestampToAPI(newApi,uuid,time,macAddress,"2")){
+        status_kirim = true;
+      } else {
+        status_kirim = false;
+      }
+      delay(1000); // Tunggu 1 detik sebelum mengirim objek berikutnya
+    }
+  }
+  Serial.print("status kirim: ");
+  Serial.println(status_kirim);
+  Serial.println("------------");
+  if(status_kirim){
+    SD.remove("/apidata.txt");
+  }
+  Serial.println("read UID file");
+  serializeJsonPretty(jsonData[0], Serial);
+  Serial.println();
+  Serial.println("Jumlah array : ");
+  Serial.println(jumlah);
+
+  configFile.close();
+  return true;
+}
+
+//Fungsi untuk simpan UID offline
+bool onlyReadUID(const char* path) {
+  File configFile = SD.open(path, FILE_READ);
+  if (!configFile) {
+    return false;
+  }
+  const size_t bufferSize = JSON_ARRAY_SIZE(6) + 6*JSON_OBJECT_SIZE(4) + 240;
+  DynamicJsonDocument jsonData(bufferSize);
+  // StaticJsonDocument<1024> jsonData;
+  // Buat objek JSON untuk menyimpan konfigurasi
+  DeserializationError error = deserializeJson(jsonData, configFile);
+
+  if (error) {
+    Serial.println("Failed to read data.json file");
+    configFile.close();
+    return false;
+  }
+  int jumlah = jsonData[0].size();
+  bool status_kirim = false;
+  JsonArray data_array = jsonData[0].as<JsonArray>();
+  if(jumlah>0){
+    for (int key = 0; key < data_array.size(); key++) {
+      JsonObject obj = data_array[key];
+      const char* uuid = obj["uuid"];
+      const char* time = obj["time"];
+      const char* hwid = obj["hwid"];
+      const char* stat = obj["stat"];
+      Serial.print("Key: ");
+      Serial.println(key);
+      Serial.print("UUID: ");
+      Serial.println(uuid);
+      Serial.print("Time: ");
+      Serial.println(time);
+      Serial.print("HWID: ");
+      Serial.println(hwid);
+      Serial.print("Stat: ");
+      Serial.println(stat);
+      Serial.println("----------");
+    }
+  }
+  Serial.print("status kirim: ");
+  Serial.println(status_kirim);
+  Serial.println("------------");
+
+  Serial.println("read UID file");
+  serializeJsonPretty(jsonData[0], Serial);
+  Serial.println();
+  Serial.println("Jumlah array : ");
+  Serial.println(jumlah);
+
+  configFile.close();
+  return true;
+}
+
+void removeData(){
+
+}
+
+void loop() {
+  // saveParamCallback();
+  // Serial.println("bagong");
+  // Serial.println(WiFi.SSID());
+  // Serial.println(WiFi.psk());
+  // Serial.println(String(apiEndpoint));
+  if(!sdCardInserted){
+    digitalWrite(RED_PIN,LOW);
+    delay(300);
+    digitalWrite(RED_PIN,HIGH);
+    delay(100);
+  }
+  readConfigFromSD("/config.txt");
+  // Serial.println(newApi);
+  onlyReadUID("/apidata.txt");
+  // ReadFile("/apidata.txt");
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    digitalWrite(BUZZER_PIN,LOW);
+    delay(300);
+    digitalWrite(BUZZER_PIN,HIGH);
+    delay(100);
+    Serial.print("UID tag: ");
+    String content = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      content.concat(String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : ""));
+      content.concat(String(mfrc522.uid.uidByte[i], HEX));
+    }
+    content.toUpperCase();
+    Serial.println(content);
+    
+    String timestamp = getCurrentDateTime();
+
+    if (checkInternet()) {
+      Serial.print("Checking internet .....");
+      Serial.print(checkInternet());
+      delay(500);
+      if (sendUIDAndTimestampToAPI(newApi, content, timestamp, macAddress, "1")) {
+        digitalWrite(GREEN_PIN,LOW);
+        delay(300);
+        digitalWrite(GREEN_PIN,HIGH);
+        delay(100);
+        readUID("/apidata.txt");
+        Serial.println("UID and timestamp sent to API successfully.");
+        Serial.print("UID: ");
+        Serial.println(content);
+        Serial.print("Timestamp: ");
+        Serial.println(timestamp);
+      } else {
+        digitalWrite(RED_PIN,LOW);
+        delay(300);
+        digitalWrite(RED_PIN,HIGH);
+        delay(100);
+        Serial.println("Failed to send UID and timestamp to API.");
+        // Membuat pesan menggunakan String
+        // String message = "Card Data: " + String(content) + " Timestamp: " + String(timestamp);
+
+        // // Konversi String menjadi const char*
+        // const char* messageChar = message.c_str();
+        // WriteFile("/data.txt",messageChar);
+        writeUID(fileName,String(content),String(timestamp),"2");
+        // addNewData(String(content),String(timestamp));
+      }
+    } else {
+      Serial.println("Wi-Fi not connected. Cannot send UID and timestamp to API.");
+    }
+    // dataFile = SD.open("/data.txt");
+    // if (dataFile) {
+    //   dataFile.println("Card Data: " + content);
+    //   dataFile.println("Timestamp: " + timestamp);
+    //   dataFile.println();
+    //   dataFile.close();
+    //   Serial.println("Data written to SD card.");
+    // } else {
+    //   Serial.println("Error opening data.txt on SD card.");
+    // }
+
+    delay(500);
+  }
+  checkButton();
+  // if (configChanged) {
+  //   if (writeConfigToSD("/config.txt", ssid, password, apiEndpoint)) {
+  //     Serial.println("Configuration saved to SD card.");
+  //   } else {
+  //     Serial.println("Failed to save configuration to SD card.");
+  //   }
+  //   configChanged = false;
+  // }
+  // ReadFile("/data.txt");
+  delay(3000);
+}
+
+void deleteDataFromSD(int keyToDelete) {
+  // Buka file data.json pada kartu SD untuk operasi baca dan tulis
+  File file = SD.open("/apidata.txt", FILE_WRITE);
+
+  if (!file) {
+    Serial.println("Gagal membuka file data.json untuk menghapus data!");
+    return;
+  }
+
+  // Buat buffer untuk menyimpan isi file JSON
+  const size_t bufferSize = JSON_ARRAY_SIZE(6) + 6 * JSON_OBJECT_SIZE(4) + 240;
+  DynamicJsonDocument doc(bufferSize);
+
+  // Parse isi file JSON
+  DeserializationError error = deserializeJson(doc, file);
+  if (error) {
+    Serial.println("Gagal mengurai JSON!");
+    file.close();
+    return;
+  }
+
+  // Mengakses array JSON dalam dokumen
+  JsonArray data_array = doc[0].as<JsonArray>();
+
+  // Hapus objek dengan key tertentu dari array
+  if (keyToDelete >= 0 && keyToDelete < data_array.size()) {
+    data_array.remove(keyToDelete);
+  }
+
+  // Tutup file
+  file.close();
+
+  // Buka file kembali untuk menulis data yang diperbarui
+  file = SD.open("/apidata.txt", FILE_WRITE);
+
+  if (!file) {
+    Serial.println("Gagal membuka file data.json untuk menulis data yang diperbarui!");
+    return;
+  }
+
+  // Serialize dokumen JSON ke file
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Gagal menulis data yang diperbarui ke file!");
+  } else {
+    Serial.println("Data berhasil dihapus dari kartu SD!");
+  }
+
+  // Tutup file kembali
+  file.close();
+}
